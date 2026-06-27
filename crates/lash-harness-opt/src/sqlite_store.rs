@@ -313,6 +313,51 @@ impl HarnessOptStore for SqliteHarnessStore {
         Ok(())
     }
 
+    async fn proposals(&self) -> Result<Vec<ProposalRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT run_id, generation, parent_ids_json, selected_components_json,
+                   minibatch_ids_json, patches_json, rlm_prompt_ref, rlm_output_ref,
+                   before_score, after_score, accepted, reason, candidate_id
+            FROM proposals ORDER BY id
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let parent_ids: Vec<String> = serde_json::from_str(&row.get::<_, String>(2)?)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let selected_components: Vec<String> =
+                serde_json::from_str(&row.get::<_, String>(3)?)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let minibatch_ids: Vec<String> = serde_json::from_str(&row.get::<_, String>(4)?)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let patches: Vec<crate::ComponentPatch> =
+                serde_json::from_str(&row.get::<_, String>(5)?)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            Ok(ProposalRecord {
+                run_id: row.get(0)?,
+                generation: row.get::<_, i64>(1)? as usize,
+                parent_ids,
+                selected_components,
+                minibatch_ids,
+                patches,
+                rlm_prompt_ref: row
+                    .get::<_, Option<String>>(6)?
+                    .map(std::path::PathBuf::from),
+                rlm_output_ref: row
+                    .get::<_, Option<String>>(7)?
+                    .map(std::path::PathBuf::from),
+                before_score: row.get(8)?,
+                after_score: row.get(9)?,
+                accepted: row.get::<_, i64>(10)? != 0,
+                reason: row.get(11)?,
+                candidate_id: row.get(12)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     async fn insert_proposal(&self, record: &ProposalRecord) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(

@@ -17,6 +17,14 @@ impl<P> HarnessRunner for ProjectHarnessRunner<P>
 where
     P: HarnessProject + 'static,
 {
+    async fn on_candidate_accepted(
+        &self,
+        run: &OptimizationRun,
+        store: &dyn HarnessOptStore,
+    ) -> Result<()> {
+        self.project.on_candidate_accepted(run, store).await
+    }
+
     async fn evaluate_candidate(
         &self,
         run: &OptimizationRun,
@@ -306,6 +314,11 @@ where
                         candidate_id: Some(candidate.id),
                     })
                     .await?;
+                if accepted {
+                    self.runner
+                        .on_candidate_accepted(&run, store as &dyn HarnessOptStore)
+                        .await?;
+                }
             }
 
             if run.config.use_merge && merge_invocations < run.config.max_merge_invocations {

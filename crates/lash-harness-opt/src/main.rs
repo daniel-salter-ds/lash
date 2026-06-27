@@ -11,6 +11,8 @@ use lash_core::TurnInput;
 use lash_harness_opt::strategies::gepa::{
     ReflectiveGepaStrategy, ReflectiveProposalRequest, ReflectiveProposer,
 };
+use lash_harness_opt::gepa_summary::write_gepa_summary;
+use lash_harness_opt::synthetic_task::SyntheticTask;
 use lash_harness_opt::toybench::{ToybenchConfig, ToybenchProject};
 use lash_harness_opt::{
     Candidate, CandidateSelection, ComponentSelection, FrontierMode, HarnessOptStore,
@@ -85,6 +87,24 @@ enum OptimizeProject {
         proposer_max_context_tokens: usize,
         #[arg(long)]
         proposer_prompt: Option<PathBuf>,
+    },
+    /// Run GEPA optimisation on the synthetic capital-cities task.
+    Synthetic {
+        /// Directory for this optimisation run's outputs.
+        #[arg(long)]
+        run_dir: PathBuf,
+        /// Maximum number of metric calls (evaluations) before stopping.
+        #[arg(long, default_value_t = 30)]
+        max_metric_calls: u64,
+        /// Minibatch size for each candidate evaluation.
+        #[arg(long, default_value_t = 3)]
+        minibatch_size: usize,
+        /// Override the provider (e.g. "openai-compatible").
+        #[arg(long)]
+        provider_id: Option<String>,
+        /// Override the reflection LM model slug.
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -266,6 +286,77 @@ async fn async_main() -> Result<()> {
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&state)?);
             }
+            OptimizeProject::Synthetic {
+                run_dir,
+                max_metric_calls,
+                minibatch_size,
+                provider_id,
+                model,
+            } => {
+                let provider = resolve_provider(provider_id.as_deref())?;
+                let project = Arc::new(SyntheticTask::new(provider.clone()));
+
+                let train = project.trainset().await?;
+                if train.is_empty() {
+                    bail!("synthetic task has no train examples");
+                }
+                let val = project.valset().await?;
+                let seed = project.seed_candidate().await?;
+
+                std::fs::create_dir_all(&run_dir)?;
+
+                const TASK_LM: &str = "anthropic/claude-haiku-4.5";
+                const REFLECTION_LM: &str = "anthropic/claude-sonnet-4.6";
+
+                let run = OptimizationRun {
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    experiment_id: "synthetic-qa".to_string(),
+                    run_dir: run_dir.clone(),
+                    config: OptimizationConfig {
+                        max_metric_calls,
+                        minibatch_size,
+                        max_concurrency: 4,
+                        task_lm: TASK_LM.to_string(),
+                        reflection_lm: REFLECTION_LM.to_string(),
+                        // Do not skip iterations when the minibatch is perfect, so the
+                        // budget is always consumed and the loop terminates correctly.
+                        skip_perfect_score: false,
+                        ..OptimizationConfig::default()
+                    },
+                };
+
+                // Keep a copy for post-run summary writing.
+                let run_for_summary = run.clone();
+
+                let proposer = LashRlmReflectiveProposer::new(
+                    provider,
+                    Some(model.unwrap_or_else(|| REFLECTION_LM.to_string())),
+                    None,
+                    1_000_000,
+                    None,
+                );
+                let optimizer = HarnessOptimizer::new(
+                    ProjectHarnessRunner::new(project.clone()),
+                    ReflectiveGepaStrategy::new(proposer),
+                );
+                let store = SqliteHarnessStore::open(&run_dir).await?;
+                let state = optimizer
+                    .run_with_store(
+                        run,
+                        seed,
+                        train,
+                        val,
+                        &store,
+                        CancellationToken::new(),
+                    )
+                    .await?;
+
+                // Write the GEPA summary once at run completion.
+                write_gepa_summary(&run_for_summary, project.as_ref(), &store).await?;
+
+                println!("{}", serde_json::to_string_pretty(&state)?);
+                println!("\nRun complete. Output: {}", run_dir.display());
+            }
         },
         Command::Check { project } => match project {
             CheckProject::Toybench { config } => {
@@ -425,6 +516,9 @@ impl ReflectiveProposer for LashRlmReflectiveProposer {
                 lash::persistence::InMemoryLashlangArtifactStore::new(),
             ))
             .attachment_store(Arc::new(lash::persistence::InMemoryAttachmentStore::new()))
+            .process_env_store(Arc::new(
+                lash::persistence::InMemoryProcessExecutionEnvStore::new(),
+            ))
             .provider(self.provider.clone())
             .model(model_spec);
         let core = core_builder

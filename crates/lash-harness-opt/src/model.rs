@@ -280,6 +280,14 @@ pub struct OptimizationConfig {
     pub max_merge_invocations: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_example_timeout_secs: Option<u64>,
+    /// OpenRouter / provider model slug for the task LM (evaluates candidates).
+    /// Example: `"anthropic/claude-haiku-4-5"`
+    #[serde(default)]
+    pub task_lm: String,
+    /// OpenRouter / provider model slug for the reflection LM (generates new prompt candidates).
+    /// Example: `"anthropic/claude-sonnet-4-6"`
+    #[serde(default)]
+    pub reflection_lm: String,
 }
 
 impl Default for OptimizationConfig {
@@ -297,6 +305,8 @@ impl Default for OptimizationConfig {
             use_merge: false,
             max_merge_invocations: 0,
             per_example_timeout_secs: Some(300),
+            task_lm: String::new(),
+            reflection_lm: String::new(),
         }
     }
 }
@@ -455,7 +465,28 @@ pub trait HarnessOptStore: Send + Sync {
     async fn put_cached_example(&self, candidate_fingerprint: &str, run: &ExampleRun)
     -> Result<()>;
     async fn insert_proposal(&self, record: &ProposalRecord) -> Result<()>;
+    async fn proposals(&self) -> Result<Vec<ProposalRecord>>;
     async fn stats(&self) -> Result<StoreStats>;
+}
+
+#[async_trait]
+pub trait HarnessRunner: Send + Sync {
+    async fn evaluate_candidate(
+        &self,
+        run: &OptimizationRun,
+        candidate: Candidate,
+        examples: Vec<HarnessExample>,
+        cancellation: CancellationToken,
+    ) -> Result<CandidateEvaluation>;
+    /// Called by the optimizer after a candidate is accepted and all store writes complete.
+    /// Default is a no-op; `ProjectHarnessRunner` forwards to `HarnessProject::on_candidate_accepted`.
+    async fn on_candidate_accepted(
+        &self,
+        _run: &OptimizationRun,
+        _store: &dyn HarnessOptStore,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -474,15 +505,15 @@ pub trait HarnessProject: Send + Sync {
         context: TraceContext,
         cancellation: CancellationToken,
     ) -> Result<ExampleRun>;
+    /// Called by the engine after a candidate is accepted and persisted.
+    /// Default implementation is a no-op. Override in benchmarks that need
+    /// to write per-candidate artefacts (e.g. `ObliqHarnessProject`).
+    async fn on_candidate_accepted(
+        &self,
+        _run: &OptimizationRun,
+        _store: &dyn HarnessOptStore,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
-#[async_trait]
-pub trait HarnessRunner: Send + Sync {
-    async fn evaluate_candidate(
-        &self,
-        run: &OptimizationRun,
-        candidate: Candidate,
-        examples: Vec<HarnessExample>,
-        cancellation: CancellationToken,
-    ) -> Result<CandidateEvaluation>;
-}
