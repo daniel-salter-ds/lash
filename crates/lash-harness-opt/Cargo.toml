@@ -27,3 +27,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 uuid = { workspace = true, features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

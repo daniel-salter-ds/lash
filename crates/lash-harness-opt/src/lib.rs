@@ -22,6 +22,7 @@ pub mod strategies;
 pub mod toybench;
 pub mod synthetic_task;
 pub mod gepa_summary;
+pub mod obliq;
 
 mod sqlite_store;
 pub use sqlite_store::SqliteHarnessStore;
