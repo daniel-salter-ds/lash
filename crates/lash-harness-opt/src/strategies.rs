@@ -183,7 +183,27 @@ pub mod gepa {
                 })
             })
             .collect::<Vec<_>>();
-        json!({ "examples": examples })
+
+        // Append per-example feedback as a clearly labelled text block so the reflection
+        // LLM can read it in a more structured, human-readable form alongside the JSON.
+        let feedback_sections: String = runs
+            .iter()
+            .filter_map(|run| {
+                run.result.feedback.as_deref().map(|fb| {
+                    format!("--- Example {} ---\n{}\n", run.example.id, fb)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        json!({
+            "examples": examples,
+            "feedback_sections": if feedback_sections.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(feedback_sections)
+            },
+        })
     }
 
     fn render_trace_record(record: &TraceRecord) -> Value {

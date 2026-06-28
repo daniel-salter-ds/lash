@@ -12,6 +12,7 @@ use lash_harness_opt::strategies::gepa::{
     ReflectiveGepaStrategy, ReflectiveProposalRequest, ReflectiveProposer,
 };
 use lash_harness_opt::gepa_summary::write_gepa_summary;
+use lash_harness_opt::obliq::{ObliqHarnessProject, detect_lash_oblique_bin};
 use lash_harness_opt::synthetic_task::SyntheticTask;
 use lash_harness_opt::toybench::{ToybenchConfig, ToybenchProject};
 use lash_harness_opt::{
@@ -42,6 +43,7 @@ enum Command {
         project: CheckProject,
     },
     Stats {
+        #[arg(long)]
         run_dir: PathBuf,
     },
     Eval {
@@ -105,6 +107,36 @@ enum OptimizeProject {
         /// Override the reflection LM model slug.
         #[arg(long)]
         model: Option<String>,
+    },
+    /// Run GEPA optimisation on the OBLIQ-Bench math subset.
+    Obliq {
+        /// Directory for this optimisation run's outputs.
+        #[arg(long)]
+        run_dir: PathBuf,
+        /// Path to the lash-oblique workspace root (must contain `scripts/`).
+        #[arg(long)]
+        lash_oblique_dir: PathBuf,
+        /// Path to the OBLIQ-Bench data directory (contains `math/queries.jsonl`).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Task LM model slug passed to the lash-oblique subprocess.
+        #[arg(long)]
+        model: String,
+        /// Optional model variant passed to the subprocess.
+        #[arg(long)]
+        variant: Option<String>,
+        /// Model slug for the task LM stored in OptimizationConfig.
+        #[arg(long)]
+        task_lm: String,
+        /// Model slug for the reflection LM used by the proposer.
+        #[arg(long)]
+        reflection_lm: String,
+        /// Maximum number of metric calls before stopping.
+        #[arg(long, default_value_t = 100)]
+        max_metric_calls: u64,
+        /// Terms that must appear in every candidate's task instructions (repeatable).
+        #[arg(long)]
+        preserve_term: Vec<String>,
     },
 }
 
@@ -349,6 +381,99 @@ async fn async_main() -> Result<()> {
                     .await?;
 
                 // Write the GEPA summary once at run completion.
+                write_gepa_summary(&run_for_summary, project.as_ref(), &store).await?;
+
+                println!("{}", serde_json::to_string_pretty(&state)?);
+                println!("\nRun complete. Output: {}", run_dir.display());
+            }
+            OptimizeProject::Obliq {
+                run_dir,
+                lash_oblique_dir,
+                data_dir,
+                model,
+                variant,
+                task_lm,
+                reflection_lm,
+                max_metric_calls,
+                preserve_term,
+            } => {
+                let lash_oblique_bin = detect_lash_oblique_bin(&lash_oblique_dir);
+                if !lash_oblique_bin.exists() {
+                    bail!(
+                        "lash-oblique binary not found at {}. \
+                         Run `cargo build --release -p lash-oblique` in the lash-oblique \
+                         workspace first.",
+                        lash_oblique_bin.display()
+                    );
+                }
+
+                let project = Arc::new(
+                    ObliqHarnessProject::new(
+                        lash_oblique_bin,
+                        lash_oblique_dir,
+                        data_dir,
+                        model,
+                        variant,
+                        preserve_term,
+                    )
+                    .context("failed to construct ObliqHarnessProject")?,
+                );
+
+                let train = project.trainset().await?;
+                if train.is_empty() {
+                    bail!("obliq project has no train examples");
+                }
+                let val = project.valset().await?;
+                let seed = project.seed_candidate().await?;
+
+                std::fs::create_dir_all(&run_dir)?;
+
+                let run = OptimizationRun {
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    experiment_id: "obliq-math-rep10".to_string(),
+                    run_dir: run_dir.clone(),
+                    config: OptimizationConfig {
+                        max_metric_calls,
+                        minibatch_size: 3,
+                        max_concurrency: 2,
+                        skip_perfect_score: false,
+                        task_lm: task_lm.clone(),
+                        reflection_lm: reflection_lm.clone(),
+                        per_example_timeout_secs: Some(300),
+                        ..OptimizationConfig::default()
+                    },
+                };
+
+                // Keep a copy for post-run summary writing.
+                let run_for_summary = run.clone();
+
+                let provider = resolve_provider(None)?;
+                let proposer = LashRlmReflectiveProposer::new(
+                    provider,
+                    Some(reflection_lm),
+                    None,
+                    1_000_000,
+                    None,
+                );
+                let optimizer = HarnessOptimizer::new(
+                    ProjectHarnessRunner::new(project.clone()),
+                    ReflectiveGepaStrategy::new(proposer),
+                );
+                let store = SqliteHarnessStore::open(&run_dir).await?;
+                let state = optimizer
+                    .run_with_store(
+                        run,
+                        seed,
+                        train,
+                        val,
+                        &store,
+                        CancellationToken::new(),
+                    )
+                    .await?;
+
+                // ObliqHarnessProject::on_candidate_accepted writes the summary after
+                // each accepted candidate; also write it at completion to capture the
+                // final state.
                 write_gepa_summary(&run_for_summary, project.as_ref(), &store).await?;
 
                 println!("{}", serde_json::to_string_pretty(&state)?);

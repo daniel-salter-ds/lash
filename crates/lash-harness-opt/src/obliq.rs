@@ -12,15 +12,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use lash_trace::{TraceContext, TraceRecord};
+use lash_trace::{TraceContext, TraceEvent, TraceRecord};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     Candidate, ComponentConstraints, ComponentValue, EvaluationResult, ExampleRun,
-    HarnessExample, HarnessOptError, HarnessProject, MutableComponent, OptimizationRun, Result,
-    RunArtifacts, Split, TraceBundle,
+    HarnessExample, HarnessOptError, HarnessOptStore, HarnessProject, MutableComponent,
+    OptimizationRun, Result, RunArtifacts, Split, TraceBundle,
 };
+use crate::gepa_summary::write_gepa_summary;
 
 // ---------------------------------------------------------------------------
 // Dataset split
@@ -125,6 +126,125 @@ pub fn gold_coverage(ranked_ids: &[String], gold: &HashMap<String, f64>, k: usiz
     }
     let found = ranked_ids.iter().take(k).filter(|id| gold.contains_key(*id)).count();
     found as f64 / gold.len() as f64
+}
+
+// ---------------------------------------------------------------------------
+// ASI feedback builder
+// ---------------------------------------------------------------------------
+
+/// Build a structured feedback string for the reflection LM from one evaluated example.
+///
+/// Extracts search queries from `ToolCallStarted` trace events, counts tool calls by name,
+/// computes gold document coverage, and formats a concise diagnostic string.
+/// The output is stored in `EvaluationResult.feedback` and surfaced to the reflection LLM
+/// via `render_reflective_evidence`.
+///
+/// Token budget: search queries are truncated to the first 8; submitted doc IDs to the first 10;
+/// final agent text to 300 characters.
+pub fn build_asi_feedback(
+    trace_records: &[TraceRecord],
+    ranked_doc_ids: &[String],
+    gold: &HashMap<String, f64>,
+    ndcg_at_10: f64,
+    final_agent_text: &str,
+) -> String {
+    // Collect search queries and count all tool calls from ToolCallStarted events.
+    let mut search_queries: Vec<String> = Vec::new();
+    let mut tool_call_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for record in trace_records {
+        if let TraceEvent::ToolCallStarted { name, args, .. } = &record.event {
+            *tool_call_counts.entry(name.clone()).or_insert(0) += 1;
+
+            if name == "search" && search_queries.len() < 8 {
+                // Support both "query" (single string) and "queries" (array) arg formats.
+                let query = args["query"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        args["queries"]
+                            .as_array()
+                            .and_then(|arr| arr.first())
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    });
+                if let Some(q) = query {
+                    search_queries.push(q);
+                }
+            }
+        }
+    }
+
+    let total_search_calls = tool_call_counts.get("search").copied().unwrap_or(0);
+
+    // Format tool call summary line.
+    let tool_summary = if tool_call_counts.is_empty() {
+        "none — agent submitted without using retrieval tools".to_string()
+    } else {
+        tool_call_counts
+            .iter()
+            .map(|(name, count)| format!("{name}×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // Format search queries section.
+    let search_section = if total_search_calls == 0 {
+        "  (none — agent made no search calls)".to_string()
+    } else {
+        let mut lines: Vec<String> = search_queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                let truncated: String = q.chars().take(100).collect();
+                format!("  {}. \"{truncated}\"", i + 1)
+            })
+            .collect();
+        if total_search_calls > 8 {
+            lines.push(format!(
+                "  ... ({total_search_calls} total, showing first 8)"
+            ));
+        }
+        lines.join("\n")
+    };
+
+    // Gold coverage: how many gold docs appear in the top-100 submitted list.
+    let gold_total = gold.len();
+    let gold_in_top100 = ranked_doc_ids
+        .iter()
+        .take(100)
+        .filter(|id| gold.contains_key(*id))
+        .count();
+
+    // Top-10 submitted doc IDs for quick inspection.
+    let top_docs_str = if ranked_doc_ids.is_empty() {
+        "(none submitted)".to_string()
+    } else {
+        let top: Vec<&str> = ranked_doc_ids.iter().take(10).map(String::as_str).collect();
+        format!("[{}]", top.join(", "))
+    };
+
+    // Final agent text (last LLM response), truncated to 300 chars.
+    let agent_text_display = if final_agent_text.is_empty() {
+        "(empty)".to_string()
+    } else {
+        let char_count = final_agent_text.chars().count();
+        let truncated: String = final_agent_text.chars().take(300).collect();
+        if char_count > 300 {
+            format!("{truncated}...")
+        } else {
+            truncated
+        }
+    };
+
+    format!(
+        "Score: NDCG@10={ndcg_at_10:.3}\n\
+         Tool calls: {tool_summary}\n\
+         Search queries issued:\n{search_section}\n\
+         Gold coverage: {gold_in_top100}/{gold_total} gold documents in top 100\n\
+         Top submitted docs: {top_docs_str}\n\
+         Final agent text: {agent_text_display}"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -358,15 +478,16 @@ impl HarnessProject for ObliqHarnessProject {
         let instructions_file = candidate_work_dir.join("obliq-instructions.txt");
         tokio::fs::write(&instructions_file, &instructions).await?;
 
-        // Step 4 — Per-candidate output directory for this run.
-        // The subprocess writes to <output_dir>/<config_hash>/math/<task_id>.json.
-        // We point --output-dir at a candidate-specific path so each candidate's
-        // benchmark outputs are isolated. The subprocess CWD stays at lash_oblique_dir
-        // so it can locate scripts/query_math_qdrant.py.
+        // Step 4 — Per-(candidate, example) output directory.
+        // The subprocess writes to <output_dir>/<config_hash>/math/<task_id>.json and
+        // updates _latest to point to the most recent config-hash directory.
+        // Using a per-example subdirectory prevents concurrent evaluations for the same
+        // candidate from overwriting each other's _latest pointer.
         let candidate_output_dir = candidate_work_dir
             .join(".benchmarks")
             .join("obliq")
-            .join("runs");
+            .join("runs")
+            .join(&example.id);
         tokio::fs::create_dir_all(&candidate_output_dir).await?;
 
         // Step 5 — Invoke subprocess
@@ -516,12 +637,26 @@ impl HarnessProject for ObliqHarnessProject {
             vec![]
         };
 
-        // Step 10 — Build and return ExampleRun
-        let feedback = format!(
-            "NDCG@10={score:.3} | recall@10={recall_at_10:.3} | recall@100={recall_at_100:.3} \
-             | gold_docs={gold_count} | tool_calls={tool_calls} | errors={errors_count} \
-             | ranked_docs={}",
-            ranked_doc_ids.len()
+        // Step 10 — Build rich feedback string for the reflection LM.
+        // Extract the last non-empty LLM response text from the trace.
+        let final_agent_text: String = {
+            let mut last = String::new();
+            for record in &trace_records {
+                if let TraceEvent::LlmCallCompleted { response, .. } = &record.event {
+                    if !response.text.is_empty() {
+                        last.clone_from(&response.text);
+                    }
+                }
+            }
+            last
+        };
+        let gold_qrels = self.qrels.get(&example.id).cloned().unwrap_or_default();
+        let feedback = build_asi_feedback(
+            &trace_records,
+            &ranked_doc_ids,
+            &gold_qrels,
+            score,
+            &final_agent_text,
         );
 
         let mut metrics = BTreeMap::new();
@@ -557,6 +692,14 @@ impl HarnessProject for ObliqHarnessProject {
             },
             metric_calls: 1,
         })
+    }
+
+    async fn on_candidate_accepted(
+        &self,
+        run: &OptimizationRun,
+        store: &dyn HarnessOptStore,
+    ) -> Result<()> {
+        write_gepa_summary(run, self, store).await
     }
 }
 
@@ -676,6 +819,140 @@ mod tests {
             assert!(seen.insert(id), "duplicate query id: {id}");
         }
         assert_eq!(seen.len(), 10, "combined split must cover all 10 math-rep10 queries");
+    }
+
+    // ---- Test 4: build_asi_feedback — search query extraction ----
+
+    #[test]
+    fn build_asi_feedback_extracts_search_queries_and_tool_counts() {
+        let fixture_search = serde_json::json!({
+            "schema_version": 2,
+            "id": "test-uuid-1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "context": {},
+            "type": "tool_call_started",
+            "call_id": null,
+            "name": "search",
+            "args": { "query": "proof by induction algebra" }
+        });
+        let record_search: lash_trace::TraceRecord =
+            serde_json::from_value(fixture_search).unwrap();
+
+        let fixture_judge = serde_json::json!({
+            "schema_version": 2,
+            "id": "test-uuid-2",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "context": {},
+            "type": "tool_call_started",
+            "call_id": null,
+            "name": "judge_candidates",
+            "args": { "candidates": ["d1", "d2"] }
+        });
+        let record_judge: lash_trace::TraceRecord =
+            serde_json::from_value(fixture_judge).unwrap();
+
+        let fixture_turn = serde_json::json!({
+            "schema_version": 2,
+            "id": "test-uuid-3",
+            "timestamp": "2026-01-01T00:00:02Z",
+            "context": {},
+            "type": "turn_started"
+        });
+        let record_turn: lash_trace::TraceRecord =
+            serde_json::from_value(fixture_turn).unwrap();
+
+        let records = vec![record_search, record_judge, record_turn];
+        let gold: HashMap<String, f64> = HashMap::new();
+        let feedback = build_asi_feedback(&records, &[], &gold, 0.0, "");
+
+        assert!(
+            feedback.contains("proof by induction algebra"),
+            "feedback should contain the search query; got: {feedback}"
+        );
+        assert!(
+            feedback.contains("search×1"),
+            "feedback should show search×1; got: {feedback}"
+        );
+        assert!(
+            feedback.contains("judge_candidates×1"),
+            "feedback should show judge_candidates×1; got: {feedback}"
+        );
+    }
+
+    // ---- Test 5: build_asi_feedback — zero tool calls ----
+
+    #[test]
+    fn build_asi_feedback_zero_tool_calls_produces_explicit_message() {
+        let gold: HashMap<String, f64> = HashMap::new();
+        let feedback = build_asi_feedback(&[], &[], &gold, 0.0, "");
+        assert!(
+            feedback.contains("none"),
+            "feedback for zero tool calls should contain 'none'; got: {feedback}"
+        );
+        // No panic is also verified by reaching this line.
+    }
+
+    // ---- Test 6: build_asi_feedback — gold coverage ----
+
+    #[test]
+    fn build_asi_feedback_gold_coverage_in_feedback_string() {
+        let ranked_with_gold: Vec<String> =
+            ["d_gold", "d_other1", "d_other2"].iter().map(|s| s.to_string()).collect();
+        let mut gold: HashMap<String, f64> = HashMap::new();
+        gold.insert("d_gold".to_string(), 1.0);
+
+        let feedback_hit = build_asi_feedback(&[], &ranked_with_gold, &gold, 0.0, "");
+        assert!(
+            feedback_hit.contains("1/1"),
+            "feedback should show 1/1 gold coverage; got: {feedback_hit}"
+        );
+
+        let ranked_no_gold: Vec<String> =
+            ["d_other1", "d_other2"].iter().map(|s| s.to_string()).collect();
+        let feedback_miss = build_asi_feedback(&[], &ranked_no_gold, &gold, 0.0, "");
+        assert!(
+            feedback_miss.contains("0/1"),
+            "feedback should show 0/1 gold coverage; got: {feedback_miss}"
+        );
+    }
+
+    // ---- Test 7: build_asi_feedback — token budget truncation ----
+
+    #[test]
+    fn build_asi_feedback_truncates_to_eight_search_queries() {
+        let records: Vec<lash_trace::TraceRecord> = (1u32..=12)
+            .map(|i| {
+                let fixture = serde_json::json!({
+                    "schema_version": 2,
+                    "id": format!("test-uuid-{i}"),
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "context": {},
+                    "type": "tool_call_started",
+                    "call_id": null,
+                    "name": "search",
+                    "args": { "query": format!("search query number {i}") }
+                });
+                serde_json::from_value(fixture).unwrap()
+            })
+            .collect();
+
+        let gold: HashMap<String, f64> = HashMap::new();
+        let feedback = build_asi_feedback(&records, &[], &gold, 0.0, "");
+
+        // Query 8 should appear (1-indexed), query 9 should not.
+        assert!(
+            feedback.contains("8."),
+            "feedback should show query 8; got: {feedback}"
+        );
+        assert!(
+            !feedback.contains("9."),
+            "feedback should not show query 9; got: {feedback}"
+        );
+        // Total count (12) should be mentioned.
+        assert!(
+            feedback.contains("12"),
+            "feedback should indicate 12 total queries; got: {feedback}"
+        );
     }
 
     // ---- Smoke test (requires Qdrant and lash-oblique binary) ----
