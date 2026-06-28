@@ -318,9 +318,6 @@ async fn async_main() -> Result<()> {
                         max_concurrency: 4,
                         task_lm: TASK_LM.to_string(),
                         reflection_lm: REFLECTION_LM.to_string(),
-                        // Do not skip iterations when the minibatch is perfect, so the
-                        // budget is always consumed and the loop terminates correctly.
-                        skip_perfect_score: false,
                         ..OptimizationConfig::default()
                     },
                 };
