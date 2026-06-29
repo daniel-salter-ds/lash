@@ -173,7 +173,11 @@ where
     {
         tokio::fs::create_dir_all(&run.run_dir).await?;
         store.init_run(&run).await?;
-        let run = store.load_run().await?.unwrap_or(run);
+        // Preserve the caller-supplied budget before load_run() overwrites it with
+        // the value stored in the DB (which may be lower from a previous partial run).
+        let new_max_metric_calls = run.config.max_metric_calls;
+        let mut run = store.load_run().await?.unwrap_or(run);
+        run.config.max_metric_calls = new_max_metric_calls;
         let valset = if valset.is_empty() {
             trainset.clone()
         } else {

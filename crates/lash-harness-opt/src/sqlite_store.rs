@@ -103,7 +103,11 @@ impl HarnessOptStore for SqliteHarnessStore {
     async fn init_run(&self, run: &OptimizationRun) -> Result<()> {
         let existing = self.load_run().await?;
         if let Some(existing) = existing {
-            if existing.experiment_id != run.experiment_id || existing.config != run.config {
+            // max_metric_calls is a mutable resume parameter — exclude it from the
+            // compatibility check so a resumed run can raise (or lower) the budget.
+            let mut existing_norm = existing.config.clone();
+            existing_norm.max_metric_calls = run.config.max_metric_calls;
+            if existing.experiment_id != run.experiment_id || existing_norm != run.config {
                 return Err(HarnessOptError::Store(
                     "existing harness-opt.sqlite has incompatible run config".to_string(),
                 ));
