@@ -439,7 +439,7 @@ async fn async_main() -> Result<()> {
                         skip_perfect_score: false,
                         task_lm: task_lm.clone(),
                         reflection_lm: reflection_lm.clone(),
-                        per_example_timeout_secs: Some(300),
+                        per_example_timeout_secs: Some(600),
                         ..OptimizationConfig::default()
                     },
                 };
