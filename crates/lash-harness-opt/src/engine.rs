@@ -58,18 +58,41 @@ where
                     split: Some(example.split.as_str().to_string()),
                     ..TraceContext::default()
                 };
-                if let Some(timeout_secs) = run.config.per_example_timeout_secs {
-                    tokio::time::timeout(
+                let example_run = if let Some(timeout_secs) = run.config.per_example_timeout_secs {
+                    match tokio::time::timeout(
                         std::time::Duration::from_secs(timeout_secs),
                         project.evaluate_example(&run, &candidate, &example, context, cancellation),
                     )
                     .await
-                    .map_err(|_| HarnessOptError::Harness("example timed out".to_string()))?
+                    {
+                        Ok(result) => result?,
+                        Err(_elapsed) => ExampleRun {
+                            example: example.clone(),
+                            result: EvaluationResult {
+                                example_id: example.id.clone(),
+                                split: example.split.clone(),
+                                score: 0.0,
+                                passed: Some(false),
+                                feedback: Some(format!(
+                                    "TIMEOUT: agent did not complete within {timeout_secs}s"
+                                )),
+                                metrics: BTreeMap::new(),
+                                diagnostics: BTreeMap::from([
+                                    ("turn_outcome".into(), json!("timeout")),
+                                    ("timeout_secs".into(), json!(timeout_secs)),
+                                ]),
+                            },
+                            trace: None,
+                            artifacts: RunArtifacts::default(),
+                            metric_calls: 1,
+                        },
+                    }
                 } else {
                     project
                         .evaluate_example(&run, &candidate, &example, context, cancellation)
-                        .await
-                }
+                        .await?
+                };
+                Ok(example_run)
             }));
         }
 
