@@ -132,12 +132,24 @@ pub fn gold_coverage(ranked_ids: &[String], gold: &HashMap<String, f64>, k: usiz
 // ASI feedback builder
 // ---------------------------------------------------------------------------
 
+/// Tool names the Lashlang agent may invoke in OBLIQ-Bench traces.
+const LASHLANG_TOOL_NAMES: &[&str] =
+    &["search", "judge_candidates", "tournament_rerank", "discover_docs"];
+
 /// Build a structured feedback string for the reflection LM from one evaluated example.
 ///
-/// Extracts search queries from `ToolCallStarted` trace events, counts tool calls by name,
-/// computes gold document coverage, and formats a concise diagnostic string.
-/// The output is stored in `EvaluationResult.feedback` and surfaced to the reflection LLM
-/// via `render_reflective_evidence`.
+/// Scans `ProtocolStep` records emitted by the `runtime` plugin. Each such record contains
+/// the fully assembled Lashlang code that was executed in one protocol iteration. Tool
+/// invocations appear as `tools.TOOLNAME(` patterns in this code, and search queries are
+/// extracted from the `queries: [...]` array literals within each `tools.search(` call.
+///
+/// Tool-level LLM failures are additionally detected from `LlmCallFailed` events whose
+/// `caused_by.call_id` context-metadata encodes the tool name in the format
+/// `lashlang:<session>:resource:tool:<TOOL_NAME>:resource_operation:...`.
+///
+/// Computes gold document coverage, and formats a concise diagnostic string stored in
+/// `EvaluationResult.feedback` and surfaced to the reflection LLM via
+/// `render_reflective_evidence`.
 ///
 /// Token budget: search queries are truncated to the first 8; submitted doc IDs to the first 10;
 /// final agent text to 300 characters.
@@ -148,30 +160,57 @@ pub fn build_asi_feedback(
     ndcg_at_10: f64,
     final_agent_text: &str,
 ) -> String {
-    // Collect search queries and count all tool calls from ToolCallStarted events.
     let mut search_queries: Vec<String> = Vec::new();
     let mut tool_call_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tool_failure_counts: BTreeMap<String, usize> = BTreeMap::new();
 
     for record in trace_records {
-        if let TraceEvent::ToolCallStarted { name, args, .. } = &record.event {
-            *tool_call_counts.entry(name.clone()).or_insert(0) += 1;
-
-            if name == "search" && search_queries.len() < 8 {
-                // Support both "query" (single string) and "queries" (array) arg formats.
-                let query = args["query"]
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        args["queries"]
-                            .as_array()
-                            .and_then(|arr| arr.first())
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    });
-                if let Some(q) = query {
-                    search_queries.push(q);
+        match &record.event {
+            // Primary detection path for Lashlang (RLM mode) traces.
+            //
+            // ProtocolStep records from the runtime plugin carry the fully assembled
+            // Lashlang code block in payload["diagnostic"]["payload"]["code"].
+            // Tool invocations appear literally as `tools.TOOLNAME(` in this text.
+            TraceEvent::ProtocolStep { plugin_id, payload } if plugin_id == "runtime" => {
+                if let Some(code) = payload
+                    .get("diagnostic")
+                    .and_then(|d| d.get("payload"))
+                    .and_then(|p| p.get("code"))
+                    .and_then(|c| c.as_str())
+                {
+                    for tool in LASHLANG_TOOL_NAMES {
+                        let pattern = format!("tools.{tool}(");
+                        let count = code.matches(pattern.as_str()).count();
+                        if count > 0 {
+                            *tool_call_counts.entry((*tool).to_string()).or_insert(0) += count;
+                        }
+                    }
+                    if search_queries.len() < 8 {
+                        extract_search_queries_from_lashlang(code, &mut search_queries);
+                    }
                 }
             }
+
+            // Tool-level failure detection.
+            //
+            // When a tool's internal LLM calls fail, `LlmCallFailed` events are emitted
+            // with a `caused_by.call_id` in context metadata encoded as:
+            // `lashlang:<session>:resource:tool:<TOOL_NAME>:resource_operation:<hash>:<n>`
+            TraceEvent::LlmCallFailed { .. } => {
+                if let Some(call_id) = record
+                    .context
+                    .metadata
+                    .get("caused_by")
+                    .and_then(|c| c.get("call_id"))
+                    .and_then(|c| c.as_str())
+                {
+                    if let Some(tool_name) = extract_tool_from_caused_by_call_id(call_id) {
+                        *tool_failure_counts.entry(tool_name).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            _ => {}
         }
     }
 
@@ -186,6 +225,18 @@ pub fn build_asi_feedback(
             .map(|(name, count)| format!("{name}×{count}"))
             .collect::<Vec<_>>()
             .join(", ")
+    };
+
+    // Format optional tool-failure line (omitted when there are no failures).
+    let failure_line = if tool_failure_counts.is_empty() {
+        String::new()
+    } else {
+        let summary = tool_failure_counts
+            .iter()
+            .map(|(name, count)| format!("{name}×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Tool failures (internal LLM errors): {summary}\n")
     };
 
     // Format search queries section.
@@ -240,11 +291,67 @@ pub fn build_asi_feedback(
     format!(
         "Score: NDCG@10={ndcg_at_10:.3}\n\
          Tool calls: {tool_summary}\n\
+         {failure_line}\
          Search queries issued:\n{search_section}\n\
          Gold coverage: {gold_in_top100}/{gold_total} gold documents in top 100\n\
          Top submitted docs: {top_docs_str}\n\
          Final agent text: {agent_text_display}"
     )
+}
+
+/// Extract search queries from Lashlang code containing `tools.search({queries: [...]})` calls.
+///
+/// Splits on each `tools.search(` occurrence, finds the `queries: [...]` array in the
+/// subsequent text, and extracts each double-quoted string. Appends to `out` until it
+/// reaches 8 entries (the token-budget cap).
+fn extract_search_queries_from_lashlang(code: &str, out: &mut Vec<String>) {
+    // Each split segment starts right after a `tools.search(` occurrence.
+    for part in code.split("tools.search(").skip(1) {
+        if out.len() >= 8 {
+            break;
+        }
+        // Locate the `queries:` key.
+        let Some(queries_pos) = part.find("queries:") else {
+            continue;
+        };
+        let after_key = &part[queries_pos + "queries:".len()..];
+        let trimmed = after_key.trim_start_matches(|c: char| c.is_whitespace());
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+        let bracket_content = &trimmed[1..];
+        // The first `]` closes the queries array (query strings never contain `]`).
+        let Some(end) = bracket_content.find(']') else {
+            continue;
+        };
+        let array_str = &bracket_content[..end];
+        // Extract every double-quoted string from the array literal.
+        let mut s = array_str;
+        while let Some(q_start) = s.find('"') {
+            s = &s[q_start + 1..];
+            let Some(q_end) = s.find('"') else { break };
+            let query = &s[..q_end];
+            if !query.is_empty() && out.len() < 8 {
+                out.push(query.to_string());
+            }
+            s = &s[q_end + 1..];
+        }
+    }
+}
+
+/// Parse the tool name out of a Lashlang `caused_by.call_id` string.
+///
+/// Expected format:
+/// `lashlang:<session_id>:resource:tool:<TOOL_NAME>:resource_operation:<hash>:<n>`
+///
+/// Returns `None` if the string does not match this pattern.
+fn extract_tool_from_caused_by_call_id(call_id: &str) -> Option<String> {
+    const MARKER: &str = ":resource:tool:";
+    let pos = call_id.find(MARKER)?;
+    let after = &call_id[pos + MARKER.len()..];
+    let end = after.find(':').unwrap_or(after.len());
+    let tool_name = &after[..end];
+    if tool_name.is_empty() { None } else { Some(tool_name.to_string()) }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,48 +929,43 @@ mod tests {
     }
 
     // ---- Test 4: build_asi_feedback — search query extraction ----
+    //
+    // Uses a ProtocolStep[runtime] fixture with assembled Lashlang code, matching the
+    // format Lashlang (RLM mode) actually emits. The code block invokes both
+    // tools.search (with a queries array) and tools.judge_candidates.
 
     #[test]
     fn build_asi_feedback_extracts_search_queries_and_tool_counts() {
-        let fixture_search = serde_json::json!({
+        let lashlang_code = concat!(
+            "@label(title: \"search and judge\")\n",
+            "results = await tools.search({\n",
+            "  queries: [\n",
+            "    \"proof by induction algebra\"\n",
+            "  ],\n",
+            "  limit: 10\n",
+            "})?\n",
+            "judge = await tools.judge_candidates({\n",
+            "  verifier_predicate: \"uses induction\",\n",
+            "  candidates: [\"d1\", \"d2\"]\n",
+            "})?",
+        );
+        let fixture = serde_json::json!({
             "schema_version": 2,
             "id": "test-uuid-1",
             "timestamp": "2026-01-01T00:00:00Z",
             "context": {},
-            "type": "tool_call_started",
-            "call_id": null,
-            "name": "search",
-            "args": { "query": "proof by induction algebra" }
+            "type": "protocol_step",
+            "plugin_id": "runtime",
+            "payload": {
+                "diagnostic": {
+                    "payload": { "code": lashlang_code }
+                }
+            }
         });
-        let record_search: lash_trace::TraceRecord =
-            serde_json::from_value(fixture_search).unwrap();
+        let record: lash_trace::TraceRecord = serde_json::from_value(fixture).unwrap();
 
-        let fixture_judge = serde_json::json!({
-            "schema_version": 2,
-            "id": "test-uuid-2",
-            "timestamp": "2026-01-01T00:00:01Z",
-            "context": {},
-            "type": "tool_call_started",
-            "call_id": null,
-            "name": "judge_candidates",
-            "args": { "candidates": ["d1", "d2"] }
-        });
-        let record_judge: lash_trace::TraceRecord =
-            serde_json::from_value(fixture_judge).unwrap();
-
-        let fixture_turn = serde_json::json!({
-            "schema_version": 2,
-            "id": "test-uuid-3",
-            "timestamp": "2026-01-01T00:00:02Z",
-            "context": {},
-            "type": "turn_started"
-        });
-        let record_turn: lash_trace::TraceRecord =
-            serde_json::from_value(fixture_turn).unwrap();
-
-        let records = vec![record_search, record_judge, record_turn];
         let gold: HashMap<String, f64> = HashMap::new();
-        let feedback = build_asi_feedback(&records, &[], &gold, 0.0, "");
+        let feedback = build_asi_feedback(&[record], &[], &gold, 0.0, "");
 
         assert!(
             feedback.contains("proof by induction algebra"),
@@ -917,29 +1019,41 @@ mod tests {
     }
 
     // ---- Test 7: build_asi_feedback — token budget truncation ----
+    //
+    // Uses a single ProtocolStep[runtime] fixture whose code block contains 12
+    // tools.search() calls. build_asi_feedback must cap displayed queries at 8 and
+    // note the total count in the output.
 
     #[test]
     fn build_asi_feedback_truncates_to_eight_search_queries() {
-        let records: Vec<lash_trace::TraceRecord> = (1u32..=12)
+        // Build a Lashlang code string with 12 sequential tools.search() calls,
+        // each carrying a single query.
+        let calls: String = (1u32..=12)
             .map(|i| {
-                let fixture = serde_json::json!({
-                    "schema_version": 2,
-                    "id": format!("test-uuid-{i}"),
-                    "timestamp": "2026-01-01T00:00:00Z",
-                    "context": {},
-                    "type": "tool_call_started",
-                    "call_id": null,
-                    "name": "search",
-                    "args": { "query": format!("search query number {i}") }
-                });
-                serde_json::from_value(fixture).unwrap()
+                format!(
+                    "r{i} = await tools.search({{\n  queries: [\n    \"search query number {i}\"\n  ],\n  limit: 10\n}})?\n"
+                )
             })
             .collect();
+        let fixture = serde_json::json!({
+            "schema_version": 2,
+            "id": "test-uuid-trunc",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "context": {},
+            "type": "protocol_step",
+            "plugin_id": "runtime",
+            "payload": {
+                "diagnostic": {
+                    "payload": { "code": calls }
+                }
+            }
+        });
+        let record: lash_trace::TraceRecord = serde_json::from_value(fixture).unwrap();
 
         let gold: HashMap<String, f64> = HashMap::new();
-        let feedback = build_asi_feedback(&records, &[], &gold, 0.0, "");
+        let feedback = build_asi_feedback(&[record], &[], &gold, 0.0, "");
 
-        // Query 8 should appear (1-indexed), query 9 should not.
+        // Query 8 should appear (1-indexed in the output), query 9 should not.
         assert!(
             feedback.contains("8."),
             "feedback should show query 8; got: {feedback}"
@@ -952,6 +1066,66 @@ mod tests {
         assert!(
             feedback.contains("12"),
             "feedback should indicate 12 total queries; got: {feedback}"
+        );
+    }
+
+    // ---- Test 8: real Sonnet trace — tool calls must be detected ----
+
+    #[test]
+    fn build_asi_feedback_real_sonnet_trace_detects_tool_calls() {
+        // Load the real post-fix Sonnet 4.6 trace for q01066 (483 records).
+        // This trace contains ProtocolStep records with assembled Lashlang code
+        // that invokes search, judge_candidates, tournament_rerank, and discover_docs.
+        // It contains NO ToolCallStarted events — only ProtocolStep + RuntimeStreamEvent.
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("q01066_sonnet_post_fix.trace.jsonl");
+
+        let content = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("could not read fixture {}: {e}", fixture_path.display()));
+
+        let records: Vec<lash_trace::TraceRecord> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .enumerate()
+            .filter_map(|(i, line)| {
+                serde_json::from_str(line)
+                    .map_err(|e| eprintln!("warn: skipping line {}: {e}", i + 1))
+                    .ok()
+            })
+            .collect();
+
+        assert!(!records.is_empty(), "fixture must contain at least one record");
+
+        let gold: HashMap<String, f64> = HashMap::new();
+        let feedback = build_asi_feedback(&records, &[], &gold, 0.0, "");
+
+        // The old implementation always produced these strings for Lashlang traces
+        // (because ToolCallStarted is never emitted). The new implementation must not.
+        assert!(
+            !feedback.contains("agent submitted without using retrieval tools"),
+            "feedback must not claim agent used no tools; got:\n{feedback}"
+        );
+        assert!(
+            !feedback.contains("none — agent made no search calls"),
+            "feedback must not claim no search calls; got:\n{feedback}"
+        );
+
+        // Must detect at least one concrete tool from the real trace.
+        assert!(
+            feedback.contains("search×"),
+            "feedback must show search call count; got:\n{feedback}"
+        );
+        assert!(
+            feedback.contains("judge_candidates×"),
+            "feedback must show judge_candidates call count; got:\n{feedback}"
+        );
+
+        // Must extract at least one real search query observed in Phase 1.
+        assert!(
+            feedback.contains("urn balls drawing expectation isolated white balls sequence"),
+            "feedback must contain the observed search query; got:\n{feedback}"
         );
     }
 
