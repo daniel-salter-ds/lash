@@ -134,6 +134,10 @@ enum OptimizeProject {
         /// Maximum number of metric calls before stopping.
         #[arg(long, default_value_t = 100)]
         max_metric_calls: u64,
+        /// Maximum seconds allowed per example evaluation before it is recorded as a timeout and
+        /// skipped.
+        #[arg(long, default_value_t = 600)]
+        per_example_timeout_secs: u64,
         /// Terms that must appear in every candidate's task instructions (repeatable).
         #[arg(long)]
         preserve_term: Vec<String>,
@@ -395,6 +399,7 @@ async fn async_main() -> Result<()> {
                 task_lm,
                 reflection_lm,
                 max_metric_calls,
+                per_example_timeout_secs,
                 preserve_term,
             } => {
                 let lash_oblique_bin = detect_lash_oblique_bin(&lash_oblique_dir);
@@ -439,7 +444,7 @@ async fn async_main() -> Result<()> {
                         skip_perfect_score: false,
                         task_lm: task_lm.clone(),
                         reflection_lm: reflection_lm.clone(),
-                        per_example_timeout_secs: Some(600),
+                        per_example_timeout_secs: Some(per_example_timeout_secs),
                         ..OptimizationConfig::default()
                     },
                 };
