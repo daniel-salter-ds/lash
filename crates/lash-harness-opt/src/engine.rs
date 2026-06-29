@@ -173,11 +173,17 @@ where
     {
         tokio::fs::create_dir_all(&run.run_dir).await?;
         store.init_run(&run).await?;
-        // Preserve the caller-supplied budget before load_run() overwrites it with
-        // the value stored in the DB (which may be lower from a previous partial run).
+        // Preserve caller-supplied values before load_run() overwrites them with
+        // whatever was stored in the DB (which may differ on a different machine or
+        // after a run was rsynced from a remote host).
         let new_max_metric_calls = run.config.max_metric_calls;
+        let new_run_dir = run.run_dir.clone();
         let mut run = store.load_run().await?.unwrap_or(run);
         run.config.max_metric_calls = new_max_metric_calls;
+        // Always use the caller-supplied run_dir: the DB may contain the absolute
+        // path from the original machine (e.g. /root/… on a VPS), which would
+        // cause EROFS when resuming on macOS whose system volume is sealed.
+        run.run_dir = new_run_dir;
         let valset = if valset.is_empty() {
             trainset.clone()
         } else {
